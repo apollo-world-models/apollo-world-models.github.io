@@ -1,0 +1,52 @@
+name: Deploy Apollo World to GitHub Pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag containing the verified static site archive
+        required: true
+        default: site-2026-11-19
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the static release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --pattern site.tar.gz --pattern site.tar.gz.sha256
+      - name: Verify and unpack the static release
+        run: |
+          sha256sum -c site.tar.gz.sha256
+          mkdir _site
+          tar -xzf site.tar.gz --directory _site
+          test -f _site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
