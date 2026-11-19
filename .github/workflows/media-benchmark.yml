@@ -1,0 +1,247 @@
+name: Compare media from North America
+
+on:
+  push:
+    branches: [codex/north-america-media-benchmark]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: North America sample ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2]
+    steps:
+      - name: Download and verify both media sources
+        env:
+          SAMPLE: ${{ matrix.sample }}
+          PYTHONUNBUFFERED: '1'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections
+          import concurrent.futures
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import urllib.parse
+
+          SAMPLE = int(os.environ['SAMPLE'])
+          START = time.monotonic()
+          DEADLINE = START + 17 * 60
+          VIDEO = 'artifacts/00-cover/virtual-ride-medium.mp4'
+          MANIFEST = 'artifacts/02-generative/digital-twin/pointcloud/manifest.json'
+          VIDEO_BYTES = 29707080
+          VIDEO_SHA = 'cc5cc508a56727faf449c64d17617708c538c0946f873f5725cfa2633b160fb5'
+          MANIFEST_BYTES = 68829
+          MANIFEST_SHA = '8e7a92b21b08793c74c04f76a7cd9c298f8a35c855605a1205a5df9ed31b82c3'
+          POINT_BYTES = 76859112
+          HOSTS = [
+              ('github_pages', 'https://apollo-world-models.github.io/'),
+              ('baidu_cdn', 'https://apollogotech-dev.cdn.bcebos.com/res/cdn/'),
+          ]
+          AZURE_US = {'eastus', 'eastus2', 'centralus', 'northcentralus', 'southcentralus',
+                      'westcentralus', 'westus', 'westus2', 'westus3', 'centraluseuap', 'eastus2euap'}
+          AZURE_CA = {'canadacentral', 'canadaeast'}
+
+          def probe(url, headers=(), max_time=10):
+              command = ['curl', '-4', '--noproxy', '*', '--silent', '--show-error',
+                         '--fail', '--connect-timeout', '2', '--max-time', str(max_time)]
+              for header in headers:
+                  command += ['--header', header]
+              try:
+                  result = subprocess.run(command + [url], capture_output=True, text=True, timeout=max_time + 2)
+                  return result.stdout if result.returncode == 0 else None
+              except (subprocess.TimeoutExpired, OSError):
+                  return None
+
+          azure_raw = probe('http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text',
+                            ('Metadata:true',), 4)
+          azure_region = azure_raw.strip().lower() if azure_raw and re.fullmatch(r'[a-z0-9]+\s*', azure_raw) else None
+          azure_country = 'US' if azure_region in AZURE_US else 'CA' if azure_region in AZURE_CA else None
+
+          def geolocation(item):
+              name, url = item
+              raw = probe(url)
+              try:
+                  data = json.loads(raw or '')
+                  valid = (data.get('error') is not True if name == 'ipapi.co' else data.get('success') is True)
+                  country = data.get('country_code') if valid else None
+                  if not isinstance(country, str) or not re.fullmatch('[A-Z]{2}', country):
+                      country = None
+                  return {'source': name, 'country': country, 'available': country is not None}
+              except (ValueError, TypeError, AttributeError):
+                  return {'source': name, 'country': None, 'available': False}
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+              geo = list(pool.map(geolocation, [('ipapi.co', 'https://ipapi.co/json/'), ('ipwho.is', 'https://ipwho.is/')]))
+          countries = [item['country'] for item in geo if item['available']]
+          evidence = countries + ([azure_country] if azure_country else [])
+          conflict = len(set(evidence)) > 1 or bool(azure_region and not azure_country and any(c in ('US', 'CA') for c in countries))
+          verified = not conflict and ((len(countries) == 2 and countries[0] == countries[1] and countries[0] in ('US', 'CA'))
+                                       or (azure_country is not None and azure_country in countries))
+          outside = not conflict and bool(countries) and all(c not in ('US', 'CA') for c in countries)
+          if azure_region and not azure_country and not countries:
+              outside = True
+          location = {
+              'status': 'location_conflict' if conflict else 'verified_us_ca' if verified else 'outside_us_ca' if outside else 'location_unverified',
+              'azure_compute_region': azure_region, 'azure_country': azure_country, 'geo': geo,
+              'note': 'Unverified samples require review of Setup job Worker Region before being labelled North America.',
+          }
+          report = {'schema': 1, 'sample': SAMPLE, 'run_id': os.environ.get('GITHUB_RUN_ID'),
+                    'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+                    'started_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'location': location, 'rounds': 3, 'pointcloud_concurrency': 3, 'results': []}
+          print('MEDIA_LOCATION_JSON ' + json.dumps(location, separators=(',', ':')), flush=True)
+
+          def download(url, expected_bytes, expected_sha, read_json=False):
+              result = {'url': url, 'expected_bytes': expected_bytes, 'expected_sha256': expected_sha,
+                        'ok': False, 'http_code': None, 'file_bytes': 0, 'wire_bytes': 0,
+                        'total_seconds': None, 'wall_seconds': None, 'MB_per_second': None,
+                        'sha256': None, 'sha256_matches': False}
+              remaining = DEADLINE - time.monotonic()
+              if remaining < 1:
+                  result['error'] = 'Overall benchmark time budget exhausted'
+                  return result, None
+              max_time = min(90, remaining)
+              with tempfile.TemporaryDirectory(prefix='media-benchmark-') as directory:
+                  body = pathlib.Path(directory) / 'body'
+                  command = ['curl', '-4', '--noproxy', '*', '--silent', '--show-error', '--location',
+                             '--max-redirs', '5', '--compressed', '--connect-timeout', '15',
+                             '--max-time', str(max_time), '--output', str(body), '--write-out', '%{json}', url]
+                  began = time.monotonic()
+                  try:
+                      response = subprocess.run(command, capture_output=True, text=True, timeout=max_time + 3)
+                      result['wall_seconds'] = time.monotonic() - began
+                      result['curl_exit_code'] = response.returncode
+                      try:
+                          stats = json.loads(response.stdout)
+                      except ValueError:
+                          stats = {}
+                      result.update(http_code=stats.get('http_code'), wire_bytes=stats.get('size_download', 0),
+                                    total_seconds=stats.get('time_total'), ttfb_seconds=stats.get('time_starttransfer'),
+                                    remote_ip=stats.get('remote_ip'), effective_url=stats.get('url_effective'))
+                      if response.returncode:
+                          result['error'] = response.stderr.strip()[:300]
+                  except (subprocess.TimeoutExpired, OSError) as error:
+                      result['wall_seconds'] = time.monotonic() - began
+                      result['error'] = str(error)[:300]
+                  parsed = None
+                  if body.is_file():
+                      result['file_bytes'] = body.stat().st_size
+                      digest = hashlib.sha256()
+                      with body.open('rb') as stream:
+                          for block in iter(lambda: stream.read(1024 * 1024), b''):
+                              digest.update(block)
+                      result['sha256'] = digest.hexdigest()
+                      result['sha256_matches'] = result['sha256'] == expected_sha
+                      result['ok'] = result.get('curl_exit_code') == 0 and result['http_code'] == 200 and result['file_bytes'] == expected_bytes and result['sha256_matches']
+                      if result['ok'] and result['total_seconds'] and result['total_seconds'] > 0:
+                          result['MB_per_second'] = result['file_bytes'] / result['total_seconds'] / 1_000_000
+                      if read_json and result['ok']:
+                          try:
+                              parsed = json.loads(body.read_text())
+                          except (ValueError, UnicodeError) as error:
+                              result['ok'] = False
+                              result['error'] = str(error)[:300]
+                  if not result['ok'] and 'error' not in result:
+                      result['error'] = 'HTTP status, complete body size, or SHA-256 verification failed'
+                  return result, parsed
+
+          def pointcloud(base):
+              began = time.monotonic()
+              manifest_url = urllib.parse.urljoin(base, MANIFEST)
+              manifest_result, manifest = download(manifest_url, MANIFEST_BYTES, MANIFEST_SHA, True)
+              result = {'asset': 'pointcloud_sequence', 'ok': False, 'manifest': manifest_result, 'chunks': []}
+              if manifest_result['ok']:
+                  try:
+                      chunks = manifest['chunks']
+                      if len(chunks) != 26 or sum(chunk['byteLength'] for chunk in chunks) != POINT_BYTES:
+                          raise ValueError('Unexpected point-cloud dataset size')
+                      for chunk in chunks:
+                          if not re.fullmatch(r'frames-[0-9]+-[0-9]+-[a-f0-9]+\.awpc', chunk['url']):
+                              raise ValueError('Unexpected point-cloud chunk path')
+                      def get_chunk(chunk):
+                          item, _ = download(urllib.parse.urljoin(manifest_url, chunk['url']), chunk['byteLength'], chunk['sha256'])
+                          item['first_frame'] = chunk['firstFrame']
+                          return item
+                      with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                          result['chunks'] = list(pool.map(get_chunk, chunks))
+                      result['ok'] = all(item['ok'] for item in result['chunks'])
+                  except (ValueError, KeyError, TypeError) as error:
+                      result['error'] = str(error)
+              else:
+                  result['error'] = 'Manifest download or integrity verification failed'
+              requests = [manifest_result] + result['chunks']
+              result.update(wall_seconds=time.monotonic() - began,
+                            file_bytes=sum(item['file_bytes'] for item in requests),
+                            wire_bytes=sum(item['wire_bytes'] for item in requests),
+                            http_codes=dict(collections.Counter(str(item['http_code']) for item in requests)),
+                            sha256_verified_chunks=sum(item['ok'] for item in result['chunks']),
+                            expected_chunks=26, expected_bytes=MANIFEST_BYTES + POINT_BYTES)
+              result['MB_per_second'] = result['file_bytes'] / result['wall_seconds'] / 1_000_000 if result['ok'] else None
+              return result
+
+          def record(result):
+              report['results'].append(result)
+              print('MEDIA_RESULT_JSON ' + json.dumps(result, separators=(',', ':')), flush=True)
+              pathlib.Path('media-benchmark.json').write_text(json.dumps(report, indent=2) + '\n')
+
+          if location['status'] in ('outside_us_ca', 'location_conflict'):
+              report['status'] = 'skipped_location'
+          else:
+              for round_number in range(1, 4):
+                  order = HOSTS if (round_number + SAMPLE) % 2 == 0 else list(reversed(HOSTS))
+                  for order_index, (name, base) in enumerate(order, 1):
+                      video, _ = download(urllib.parse.urljoin(base, VIDEO), VIDEO_BYTES, VIDEO_SHA)
+                      video.update(round=round_number, host=name, host_order=order_index, asset='full_video')
+                      record(video)
+                      points = pointcloud(base)
+                      points.update(round=round_number, host=name, host_order=order_index)
+                      record(points)
+              report['status'] = 'complete' if all(item['ok'] for item in report['results']) else 'complete_with_failures'
+          report['elapsed_seconds'] = time.monotonic() - START
+          report['completed_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          pathlib.Path('media-benchmark.json').write_text(json.dumps(report, indent=2) + '\n')
+          print('MEDIA_BENCHMARK_JSON ' + json.dumps(report, separators=(',', ':')), flush=True)
+          lines = ['## Media comparison — sample ' + str(SAMPLE), '',
+                   'Location evidence: **' + location['status'] + '**. Azure region: `' + str(azure_region) + '`.',
+                   'Country evidence: `' + json.dumps(geo, separators=(',', ':')) + '`.', '',
+                   'Full GETs; no cache-busting query and no retries. Each host is tested first in alternating rounds.',
+                   'Point-cloud timing includes manifest + all 26 verified chunks, with at most 3 concurrent requests.',
+                   'MB/s uses complete decoded body bytes (decimal MB) divided by full download time; TTFB is recorded separately.',
+                   'An unverified location is not a North America result until Setup job Worker Region is reviewed.', '',
+                   '| Round | Host | Asset | Verified | HTTP | MB received | Total seconds | MB/s |',
+                   '| --- | --- | --- | --- | --- | ---: | ---: | ---: |']
+          for item in report['results']:
+              seconds = item.get('total_seconds') if item['asset'] == 'full_video' else item.get('wall_seconds')
+              speed = item.get('MB_per_second')
+              http = str(item.get('http_code')) if item['asset'] == 'full_video' else json.dumps(item['http_codes'], separators=(',', ':'))
+              lines.append('| {} | {} | {} | {} | {} | {:.2f} | {} | {} |'.format(
+                  item['round'], item['host'], item['asset'], item['ok'], http,
+                  item['file_bytes'] / 1_000_000, '{:.3f}'.format(seconds) if seconds is not None else 'n/a',
+                  '{:.3f}'.format(speed) if speed is not None else 'n/a'))
+          lines += ['', 'Status: `' + report['status'] + '`. Failed/partial downloads are not assigned a successful throughput.']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('\n'.join(lines) + '\n')
+          PY
+      - name: Save measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-benchmark-${{ matrix.sample }}
+          path: media-benchmark.json
+          if-no-files-found: warn
+          retention-days: 7
