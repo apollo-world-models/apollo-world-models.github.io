@@ -8,7 +8,7 @@ on:
       release_tag:
         description: Release tag containing the verified static site archive
         required: true
-        default: site-2026-11-19-2
+        default: site-2026-11-20-loading
 
 permissions:
   contents: read
